@@ -53,7 +53,7 @@
     const GRAPH_KEYS = ["RON 95-III", "RON92-II E5", "DO 0.05S-II", "DO 0.001S-V"];
 
     async function loadHistory() {
-      const res = await fetch('/prices.json');
+      const res = await fetch('/FuelPriceTrack/prices.json');
       return await res.json();
     }
 
