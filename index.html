@@ -1,0 +1,326 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fuel Prices & Deltas</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
+  <style>
+    .chart-container{width:95vw;margin:18px auto}
+    canvas{width:100%}
+    .range-btns { margin: 10px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .scale-toggle { margin-left:8px; }
+    .series-cards { margin-bottom:12px; }
+    .card-subtitle-date { font-size:0.85rem; color:#666; }
+  </style>
+</head>
+<body>
+  <div class="container-fluid py-3 d-flex flex-column gap-3">
+    <div class="card shadow">
+      <div class="card-body">
+        <h5 id="effectiveTitle" class="card-title mb-3">Effective — </h5>
+
+        <div id="seriesCards" class="row series-cards g-2">
+          <!-- cards injected here -->
+        </div>
+
+        <div class="range-btns">
+          <div class="btn-group" role="group" aria-label="range">
+            <button id="range-all" class="btn btn-outline-primary btn-sm">All</button>
+            <button id="range-1w" class="btn btn-outline-primary btn-sm">1w</button>
+            <button id="range-1m" class="btn btn-outline-primary btn-sm active">1m</button>
+            <button id="range-3m" class="btn btn-outline-primary btn-sm">3m</button>
+            <button id="range-6m" class="btn btn-outline-primary btn-sm">6m</button>
+          </div>
+
+          <div class="scale-toggle ms-2">
+            <div class="btn-group" role="group" aria-label="scale">
+              <button id="scale-linear" class="btn btn-outline-secondary btn-sm active">Linear</button>
+              <button id="scale-log" class="btn btn-outline-secondary btn-sm">Log</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="chart-container"><canvas id="combinedChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const COLORS = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b'];
+    const GRAPH_KEYS = ["RON 95-III", "RON92-II E5", "DO 0.05S-II", "DO 0.001S-V"];
+
+    async function loadHistory() {
+      const res = await fetch('/prices.json');
+      return await res.json();
+    }
+
+    function normalizeDate(effective) {
+      if (!effective) return null;
+      const s = effective.replace(' ', 'T');
+      const maybe = new Date(s);
+      if (!isNaN(maybe)) return maybe;
+      const m = effective.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}:\d{2})/);
+      if (m) {
+        const [_, day, month, year, time] = m;
+        return new Date(`${year}-${month.padStart(2,'0')}-${day.padStart(2,'0')}T${time}`);
+      }
+      return new Date(effective);
+    }
+
+    function fmtDateYMDHM(d) {
+      if (!(d instanceof Date)) return '';
+      const pad = n => String(n).padStart(2,'0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    (async function(){
+      const history = await loadHistory();
+      if (!Array.isArray(history) || history.length === 0) return;
+
+      const itemKeys = GRAPH_KEYS.slice();
+
+      // helper to get timestamp ms from a row
+      function rowTsMs(r) {
+        if (!r) return null;
+        const ts = r.Effective || r.Updated;
+        if (!ts) return null;
+        const d = normalizeDate(ts);
+        return (d instanceof Date && !isNaN(d)) ? d.getTime() : null;
+      }
+
+      // build price datasets: null where missing -> break line
+      const priceDatasets = itemKeys.map((key, idx) => ({
+        label: key,
+        data: history.map(r => {
+          const ts = r.Effective || r.Updated;
+          if (!ts) return null;
+          const date = normalizeDate(ts);
+          if (!(key in r) || r[key] == null) return { x: date, y: null };
+          return { x: date, y: Number(r[key]) };
+        }),
+        borderColor: COLORS[idx % COLORS.length],
+        backgroundColor: COLORS[idx % COLORS.length],
+        fill: false,
+        tension: 0,
+        stepped: true,
+        spanGaps: false,
+        yAxisID: 'price',
+        order: 2
+      }));
+
+      // build delta datasets as bars (filled) with nulls to break bars
+      const deltaDatasets = itemKeys.map((key, idx) => ({
+        label: key + ' Δ',
+        type: 'bar',
+        data: history.map((r, i) => {
+          const ts = r.Effective || r.Updated;
+          if (!ts) return null;
+          const date = normalizeDate(ts);
+          if (i === 0) return { x: date, y: null };
+          if (!(key in r) || !(key in history[i-1]) ) return { x: date, y: null };
+          const cur = r[key] == null ? null : Number(r[key]);
+          const prev = history[i-1][key] == null ? null : Number(history[i-1][key]);
+          if (cur == null || prev == null) return { x: date, y: null };
+          // use current - previous (positive when price increased)
+          return { x: date, y: Number(prev) - Number(cur) };
+        }),
+        backgroundColor: COLORS[idx % COLORS.length] + '66',
+        borderColor: COLORS[idx % COLORS.length],
+        borderWidth: 1,
+        fill: true,
+        spanGaps: false,
+        yAxisID: 'delta',
+        order: 1,
+        barPercentage: 0.8,
+        categoryPercentage: 0.8
+      }));
+
+      const combinedDatasets = [...priceDatasets, ...deltaDatasets];
+
+      // helper to get x ms
+      function pointXMs(p){
+        if (!p) return null;
+        const x = p.x ?? p;
+        if (x instanceof Date) return x.getTime();
+        const d = new Date(x);
+        return isNaN(d) ? null : d.getTime();
+      }
+      const allTimes = combinedDatasets.flatMap(ds => (ds.data || []).map(pointXMs).filter(v => v != null));
+      const fullMin = allTimes.length ? Math.min(...allTimes) : null;
+      const fullMax = allTimes.length ? Math.max(...allTimes) : null;
+
+      // set Effective title
+      const effDate = fullMax ? new Date(fullMax) : (history[history.length-1] && normalizeDate(history[history.length-1].Effective || history[history.length-1].Updated));
+      document.getElementById('effectiveTitle').textContent = 'Effective ' + (effDate ? fmtDateYMDHM(effDate) : '-');
+
+      // compute symmetric delta range
+      const allDeltaValues = deltaDatasets.flatMap(ds => (ds.data || []).map(p => (p && typeof p.y === 'number') ? p.y : null)).filter(v => v != null);
+      const maxAbs = allDeltaValues.length ? Math.max(...allDeltaValues.map(Math.abs)) : 1;
+      const deltaRange = Math.max(1, maxAbs);
+
+      // compute positive min price for log scale (smallest positive value)
+      const allPriceValues = priceDatasets.flatMap(ds => (ds.data || []).map(p => (p && typeof p.y === 'number') ? p.y : null)).filter(v => v != null && v > 0);
+      const minPositivePrice = allPriceValues.length ? Math.min(...allPriceValues) : 1;
+
+      const optionsBase = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { type: 'time', time: { tooltipFormat: 'yyyy-LL-dd HH:mm', unit: 'day' } },
+          price: {
+            type: 'linear',
+            position: 'left',
+            title: { display: true, text: 'Price' },
+            grid: { drawOnChartArea: true }
+          },
+          delta: {
+            type: 'linear',
+            position: 'right',
+            title: { display: true, text: 'Delta' },
+            min: -deltaRange,
+            max: deltaRange,
+            grid: { drawOnChartArea: false }
+          }
+        },
+        plugins: { legend: { position: 'top' } }
+      };
+
+      // create cards showing latest price/date and delta using timestamp-based latest
+      const nf = new Intl.NumberFormat('en-US');
+      const cardsContainer = document.getElementById('seriesCards');
+      cardsContainer.innerHTML = '';
+      itemKeys.forEach((key, idx) => {
+        // find latest row by timestamp where key exists
+        let bestIdx = -1;
+        let bestTs = -Infinity;
+        for (let i = 0; i < history.length; ++i) {
+          if (!history[i] || !(key in history[i]) || history[i][key] == null) continue;
+          const t = rowTsMs(history[i]);
+          if (t != null && t > bestTs) { bestTs = t; bestIdx = i; }
+        }
+
+        let curVal = null, delta = null, dateStr = '';
+        if (bestIdx >= 0) {
+          curVal = Number(history[bestIdx][key]);
+          const curTs = rowTsMs(history[bestIdx]);
+          dateStr = curTs ? fmtDateYMDHM(new Date(curTs)) : '';
+          // find previous row before bestIdx by timestamp (latest timestamp < bestTs)
+          let prevBest = -1;
+          let prevTs = -Infinity;
+          for (let j = 0; j < history.length; ++j) {
+            if (!history[j] || !(key in history[j]) || history[j][key] == null) continue;
+            const t = rowTsMs(history[j]);
+            if (t != null && t < bestTs && t > prevTs) { prevTs = t; prevBest = j; }
+          }
+          if (prevBest >= 0) {
+            delta = Number(history[bestIdx][key]) - Number(history[prevBest][key]); // current - previous
+          }
+        }
+
+        const col = document.createElement('div');
+        col.className = 'col-12 col-md-6 col-lg-3';
+        col.innerHTML = `
+          <div class="card h-100">
+            <div class="card-body">
+              <h6 class="card-subtitle mb-1 text-muted">${key}</h6>
+              <div class="card-subtitle-date mb-2">${dateStr || ''}</div>
+              <h4 class="card-title mb-1">${curVal != null ? nf.format(curVal) : '-'}</h4>
+              <div class="card-text ${delta == null ? 'text-muted' : (delta >= 0 ? 'text-success' : 'text-danger')}">
+                ${delta == null ? '' : (delta >= 0 ? '+' : '') + nf.format(delta)}
+              </div>
+            </div>
+          </div>`;
+        cardsContainer.appendChild(col);
+      });
+
+      const chartCtx = document.getElementById('combinedChart').getContext('2d');
+      const combinedChart = new Chart(chartCtx, {
+        type: 'line',
+        data: { datasets: combinedDatasets },
+        options: JSON.parse(JSON.stringify(optionsBase))
+      });
+
+      // helpers for ranges & scale
+      function setRange(minMs, maxMs) {
+        if (minMs == null || maxMs == null) {
+          combinedChart.options.scales.x.min = undefined;
+          combinedChart.options.scales.x.max = undefined;
+        } else {
+          combinedChart.options.scales.x.min = minMs;
+          combinedChart.options.scales.x.max = maxMs;
+        }
+        combinedChart.update();
+      }
+
+      function setPriceScale(type) {
+        combinedChart.options.scales.price.type = type;
+        if (type === 'logarithmic') {
+          combinedChart.options.scales.price.min = Math.max(1, minPositivePrice * 0.9);
+        } else {
+          combinedChart.options.scales.price.min = undefined;
+        }
+        combinedChart.update();
+      }
+
+      function rangeFromLabel(label) {
+        if (!fullMin || !fullMax) return null;
+        const maxDate = new Date(fullMax);
+        let minDate = new Date(fullMin);
+        switch(label) {
+          case 'all': return { min: fullMin, max: fullMax };
+          case '1w':
+            minDate = new Date(maxDate); minDate.setDate(minDate.getDate() - 7); break;
+          case '1m':
+            minDate = new Date(maxDate); minDate.setMonth(minDate.getMonth() - 1); break;
+          case '3m':
+            minDate = new Date(maxDate); minDate.setMonth(minDate.getMonth() - 3); break;
+          case '6m':
+            minDate = new Date(maxDate); minDate.setMonth(minDate.getMonth() - 6); break;
+          default: return { min: fullMin, max: fullMax };
+        }
+        const minMs = Math.max(minDate.getTime(), fullMin);
+        return { min: minMs, max: fullMax };
+      }
+
+      // wire range buttons
+      const buttons = [
+        ['range-all','all'],
+        ['range-1w','1w'],
+        ['range-1m','1m'],
+        ['range-3m','3m'],
+        ['range-6m','6m']
+      ];
+      buttons.forEach(([id,label]) => {
+        const btn = document.getElementById(id);
+        btn.addEventListener('click', () => {
+          buttons.forEach(([otherId]) => document.getElementById(otherId).classList.remove('active'));
+          btn.classList.add('active');
+          const r = rangeFromLabel(label);
+          if (r) setRange(r.min, r.max);
+        });
+      });
+
+      // wire scale buttons
+      const scaleLinearBtn = document.getElementById('scale-linear');
+      const scaleLogBtn = document.getElementById('scale-log');
+      scaleLinearBtn.addEventListener('click', () => {
+        scaleLinearBtn.classList.add('active'); scaleLogBtn.classList.remove('active');
+        setPriceScale('linear');
+      });
+      scaleLogBtn.addEventListener('click', () => {
+        scaleLogBtn.classList.add('active'); scaleLinearBtn.classList.remove('active');
+        setPriceScale('logarithmic');
+      });
+
+      // defaults: set to 1 month
+      const defaultRange = rangeFromLabel('1m');
+      if (defaultRange) setRange(defaultRange.min, defaultRange.max);
+      setPriceScale('linear');
+    })();
+  </script>
+</body>
+</html>
